@@ -45,6 +45,10 @@ class ModelOutput:
         self.w1 = None          # wave 1
         self.w3 = None          # wave 3
         self.w5 = None          # wave 5
+        self.w3_pos = None      # excitatory part of wave 3 (no inhibition)
+        self.w3_neg = None      # inhibitory part of wave 3 (starts at the click, no inhibition delay)
+        self.w5_pos = None      # excitatory part of wave 5
+        self.w5_neg = None      # inhibitory part of wave 5 (starts at the click, no inhibition delay)
         self.fs_bm = None       # sampling frequency of BM simulations
         self.fs_ihc = None      # sample rate of IHC output
         self.fs_an = None       # sample rate of AN output
@@ -127,6 +131,9 @@ def model2018(
         - cn: cochlear nuclei output (storeflag 'b')
         - ic: IC (storeflag 'b')
         - w1, w3, w5: wave 1,3 and 5 (storeflag 'w')
+        - w3_pos, w3_neg, w5_pos, w5_neg: excitatory and inhibitory part of wave 3 and 5, w3 = w3_pos + w3_neg
+          up to the inhibition delays (10 ms CN, 0.2 ms IC), which are left out of the inhibitory parts
+          (storeflag 'w', see ic_cn2018.splitNuclei)
         - fs_bm: sampling frequency of the bm simulations
         - fs_ihc: sample rate of the inner hair cell output
         - fs_an: sample rate of the an output
@@ -280,6 +287,12 @@ def model2018(
                         output.w1 = nuclei.M1 * np.sum(anSummed, axis=1)
                         output.w3 = nuclei.M3 * np.sum(cn, axis=1)
                         output.w5 = nuclei.M5 * np.sum(ic, axis=1)
+
+                        cn_pos, cn_neg, ic_pos, ic_neg = nuclei.splitNuclei(anSummed, Fs_res, cn, ic) ##Create the neg and pos components of the waves
+                        output.w3_pos = nuclei.M3 * np.sum(cn_pos, axis=1)                            ##and lists them as output dimensions.
+                        output.w3_neg = nuclei.M3 * np.sum(cn_neg, axis=1)
+                        output.w5_pos = nuclei.M5 * np.sum(ic_pos, axis=1)
+                        output.w5_neg = nuclei.M5 * np.sum(ic_neg, axis=1)
         
         return output
     

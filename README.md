@@ -178,3 +178,4 @@ Saremi A, Beutelmann R, Dietz M, Ashida G, Kretzberg J and Verhulst S (2016). A 
 <p align="center">
     <img src="doc/Model_Overview.png" alt="Model Overview" height="50%" width="50%">
 </p>
+

@@ -276,7 +276,7 @@ class cochlea_model ():
         self.SheraP = self.SheraPo + self.SheraP
         self.c = 120.8998691636393
 
-        #
+        # 
         # PROBE POINTS               ##
         #
         if(self.probe_freq=='all'):

@@ -23,8 +23,15 @@ import numpy as np
 import scipy.io as sio
 import matplotlib.pyplot as plt
 import os
-from get_RAM_stims import get_RAM_stims
+import io
+import time
+import contextlib
+import matplotlib.colors as mcolors
+from get_RAM_stims import get_RAM_stims, get_click_stim
 from model2018 import model2018
+
+from fractions import Fraction
+from scipy import signal as sps
 
 def calculate_EFR(output):
     """
@@ -82,7 +89,7 @@ def calculate_EFR(output):
         print(f"Error calculating EFR: {e}")
         return np.nan, None, None, None, None
 
-def run_easy_model(carrier_freq=4000, poles_profile='Flat00', show_plots=True, save_results=True):
+def run_easy_model(carrier_freq=4000, poles_profile='Flat00', show_plots=True, save_results=True, stim='click'):
     """
     Easy interface to run the model2018 and calculate EFR.
     
@@ -124,7 +131,11 @@ def run_easy_model(carrier_freq=4000, poles_profile='Flat00', show_plots=True, s
     # Generate stimulus
     print("Generating RAM stimulus...")
     try:
-        stimulus = get_RAM_stims(fs, fRAM)
+        if stim == 'click':
+            stimulus = get_click_stim(fs, level=80, onset=0.03, dur=0.065)
+        else:
+            stimulus = get_RAM_stims(fs, fRAM)
+
         print(f"✓ Generated stimulus: {stimulus.shape[1]} samples, duration: {stimulus.shape[1]/fs:.3f} s")
     except Exception as e:
         print(f"✗ Error generating stimulus: {e}")
@@ -301,12 +312,255 @@ def run_easy_model(carrier_freq=4000, poles_profile='Flat00', show_plots=True, s
     
     return result_dict
 
+def abr_convolution_split(output, click_onset=0.03, fMod=110, window=None, dur=None,
+                          latencies=(0.0, 0.0e-3, 0.0e-3, 0.0e-3), show_plots=True, single_click=False):
+    """
+    Same as abr_convolution_click, but the inhibition of the CN and IC is split off (by the model itself,
+    ic_cn2018.splitNuclei) and timed separately:
+    Wave_func(t) = w1(t - Lat_1) + w3_pos(t - Lat_2) + w5_pos(t - Lat_3) + w3_neg(t - Lat_4) + w5_neg(t - Lat_4)
+    Each term is the delta train shifted by its latency, convolved with the response of that component
+    to ONE click (baseline removed). The inhibitory parts have no built-in delay (the model's 10 ms CN and
+    0.2 ms IC inhibition delays are removed, see ic_cn2018.splitNuclei), so Lat_4 is when the inhibition starts
+    after the click.
+
+    Parameters:
+    -----------
+    output : ModelOutput or list containing it
+        model2018 output for ONE click (needs w1, w3_pos, w3_neg, w5_pos, w5_neg and fs_an, i.e. 'w' in storeflag)
+    click_onset : float, optional
+        Time of the click in the stimulus [s]; must equal 'onset' of get_click_stim (default 0.03). Keep it
+        above 25 ms, the inhibitory filters need that long to settle before the click
+    fMod : float, optional
+        Rate of the delta train = click rate of the simulated train [Hz] (default 110)
+    window : float or None, optional
+        Length of the unit responses after the click [s]. None = until 1 ms before the end of the model
+        output (default None)
+    dur : float or None, optional
+        Duration of the delta train and of the convolved output [s]. None = one period (1/fMod): a single
+        click, so each component is generated once and the output stops after one period (default None)
+    latencies : tuple of 4 floats, optional
+        (Lat_1, Lat_2, Lat_3, Lat_4) [s]: delay of wave I, excitatory III, excitatory V and of both
+        inhibitory parts (III and V together). Wave I and the excitatory parts keep their natural timing and
+        the latency is added to it, the inhibitory parts start at Lat_4 after the click
+        (default (0, 1.7e-3, 4.3e-3, 7e-3))
+    show_plots : bool, optional
+        Plot the results and save them as 'abr_convolution_split.png' (default True)
+    single_click : bool, optional
+        True = the delta train holds only the first click, whatever fMod is, so every response runs on for
+        the whole of dur instead of being overlapped by the next click (default False)
+
+    Returns:
+    --------
+    dict with 'unit_responses', 'rate_functions', 'convolved' (one array per component 'I', 'III+', 'V+',
+    'III-', 'V-'), 'delta_train' and 'total' (= Wave_func, 2xN arrays, row 0 = time [s]), 'latencies' and
+    'fs' (upsampled sampling frequency [Hz])
+    """
+
+    if isinstance(output, (list, tuple)):
+        output = output[0]
+    if click_onset < 0.025:
+        print("Warning: click_onset < 25 ms, the inhibitory filters have not settled before the click, "
+              "so the baseline of the inhibitory parts is off")
+    fs_in = float(output.fs_an)
+
+    up = Fraction(int(round(fs_in)), int(round(fMod))).denominator     # 11 for 20 kHz and 110 Hz
+    fs = fs_in * up
+    n_edge = int(round(1e-3 * fs_in))                   # 1 ms: baseline window before the click, guard at the end
+    i_click_in = int(round(click_onset * fs_in))        # sample of the click in the model output
+
+    # components with the pre-click baseline removed (before the upsampling, so the filter does not ring at the edges)
+    waves = {}
+    split = {'I': output.w1, 'III+': output.w3_pos, 'V+': output.w5_pos, 'III-': output.w3_neg, 'V-': output.w5_neg}
+    if any(w is None for w in split.values()):
+        raise ValueError("output has no split waves; run model2018 with 'w' in storeflag")
+    for name, w in split.items():
+        base = np.mean(w[max(i_click_in - n_edge, 0):max(i_click_in, 1)])
+        waves[name] = sps.resample_poly(w - base, up, 1)
+    if dur is None:
+        dur = 1 / fMod                                  # one period: a single click, each component generated once
+    n = int(round(dur * fs))
+    t = np.arange(n) / fs
+    L_unit = int(round(fs / fMod))                      # one period in samples (whole number after upsampling)
+    i_click = i_click_in * up                           # sample of the click after upsampling
+
+    # delta train over the whole signal: 1 at the start of every click, 0 elsewhere
+    delta = np.zeros(n)
+    if single_click:
+        delta[0] = 1
+    else:
+        delta[::L_unit] = 1
+    delta_train = np.vstack([t, delta])
+
+    # unit responses: response of each component to the click, from the click onset
+    unit_responses = {}
+    for name, w in waves.items():
+        L_ur = len(w) - i_click - n_edge * up if window is None else int(round(window * fs))
+        if L_ur <= 0 or i_click + L_ur > len(w):
+            raise ValueError(f'click_onset + window = {(i_click + L_ur) / fs * 1e3:.1f} ms does not fit in the '
+                             f'{len(w) / fs * 1e3:.1f} ms of model output; lower window or make the click epoch longer')
+        unit_responses[name] = np.vstack([np.arange(L_ur) / fs, w[i_click:i_click + L_ur]])
+
+    # I, III+, V+ and the two inhibitory parts (III-, V-) share Lat_4
+    lat_of = dict(zip(waves, (latencies[0], latencies[1], latencies[2], latencies[3], latencies[3])))
+
+    rate_functions, convolved = {}, {}
+    for name, (_, segment) in unit_responses.items():
+        lat = lat_of[name]
+
+        # rate function: delta train shifted forward by the latency (impulses pushed past the end are dropped)
+        shift = int(round(lat * fs))
+        delta_shift = np.zeros(n)
+        if shift < n:
+            delta_shift[shift:] = delta[:n - shift]
+        rate_functions[name] = np.vstack([t, delta_shift])
+
+        # rate function convolved with the unitary response
+        convolved[name] = np.vstack([t, np.convolve(delta_shift, segment, mode='full')[:n]])
+
+        i_ext = np.argmax(np.abs(segment))
+        print(f"{name}: extreme {segment[i_ext]*1e6:.4f} uV at {i_ext / fs * 1e3:.2f} ms after the click, "
+              f"shifted by {lat * 1e3:.2f} ms")
+
+    # Wave_func = sum of the five convolved components
+    total = np.vstack([t, sum(convolved[name][1] for name in convolved)])
+
+    if show_plots:
+        fig, axes = plt.subplots(4, 1, figsize=(10, 13))
+        fig.suptitle(f'ABR convolution model, excitation / inhibition split ({fMod} Hz, Lat_1..4 = '
+                     f'{latencies[0]*1e3:.1f}/{latencies[1]*1e3:.1f}/{latencies[2]*1e3:.1f}/{latencies[3]*1e3:.1f} ms)',
+                     fontsize=13)
+
+        for i, name in enumerate(unit_responses):
+            axes[0].plot(unit_responses[name][0] * 1e3, unit_responses[name][1] * 1e6, color=f'C{i}',
+                         linestyle='--' if name.endswith('-') else '-', label=name)
+        axes[0].set_xlabel('Time after the click (ms)')
+        axes[0].set_ylabel('Amplitude (uV)')
+        axes[0].legend()
+        axes[0].grid(True)
+
+        for i, name in enumerate(rate_functions):
+            spikes = rate_functions[name][0][rate_functions[name][1] == 1]
+            spikes = spikes[spikes <= 0.05]
+            axes[1].vlines(spikes * 1e3, 1.5 * i, 1.5 * i + 1, color=f'C{i}', label=name)
+        axes[1].set_xlabel('Time (ms)')
+        axes[1].set_yticks([])
+        axes[1].legend(loc='upper right')
+        axes[1].grid(True)
+
+        for i, name in enumerate(convolved):
+            axes[2].plot(convolved[name][0], convolved[name][1] * 1e6, color=f'C{i}',
+                         linestyle='--' if name.endswith('-') else '-', label=name, alpha=0.8)
+        axes[2].set_xlabel('Time (s)')
+        axes[2].set_ylabel('Amplitude (uV)')
+        axes[2].legend()
+        axes[2].grid(True)
+
+        axes[3].plot(total[0], total[1] * 1e6, label='Wave_func (sum of the five components)')
+        axes[3].set_xlim(0.0,0.04)
+        axes[3].set_xlabel('Time (s)')
+        axes[3].set_ylabel('Amplitude (uV)')
+        axes[3].legend()
+        axes[3].grid(True)
+
+        plt.tight_layout()
+        plt.savefig('abr_convolution_split.png', dpi=150, bbox_inches='tight')
+        plt.show()
+        print("✓ Plot saved as 'abr_convolution_split.png'")
+
+    return {'unit_responses': unit_responses, 'delta_train': delta_train,
+            'rate_functions': rate_functions, 'convolved': convolved, 'total': total,
+            'latencies': tuple(latencies), 'fs': fs}
+
+def frequency_runner(output, freqs=None, latencies=(0.0, 1.7e-3, 4.3e-3, 7e-3), click_onset=0.03, dur=0.04,
+                     show_plots=True):
+    """
+    Runs abr_convolution_split for every click rate in freqs and overlays the resulting Wave_func(t) curves
+    (x = time, y = amplitude), one curve per rate. The colour gets darker with increasing rate.
+    Every curve is the response to ONE click (single_click=True): the rate only enters through the latencies
+    you give per rate, and each response decays over the whole of dur, also past 1/rate. With the same
+    latencies for every rate all curves are identical, so give at least one latency per rate (sequence or
+    function of the rate).
+
+    Example: frequency_runner(results['output'], latencies=(0, [1e-3]*22, lambda f: 4e-3 + f * 1e-5, 7e-3))
+
+    Parameters:
+    -----------
+    output : ModelOutput or list containing it
+        model2018 output for ONE click (as for abr_convolution_split)
+    freqs : array-like or None, optional
+        Click rates [Hz]. None = 22 rates from 5 to 110 Hz in steps of 5 Hz (default None)
+    latencies : tuple of 4, optional
+        (Lat_1, Lat_2, Lat_3, Lat_4) [s] = wave I, excitatory III, excitatory V, inhibitory III and V, the same
+        meaning as in abr_convolution_split. Each entry is set separately and can be
+        - a number: the same latency for all rates,
+        - a sequence with one latency per rate in freqs,
+        - a function f -> latency [s]: the latency as a function of the rate.
+    click_onset : float, optional
+        Time of the click in the stimulus [s] (default 0.03)
+    dur : float, optional
+        Duration of every curve [s]; the same for all rates, so the curves are comparable (default 0.04)
+    show_plots : bool, optional
+        Plot the curves and save them as 'frequency_runner.png' (default True)
+
+    Returns:
+    --------
+    dict with 'freqs' [Hz], 'latencies' (len(freqs) x 4 array [s]), 'results' (the abr_convolution_split
+    dict of every rate), 'curves' (len(freqs) x N array of Wave_func [V]) and 't' (time axis [s]). The
+    curves are interpolated onto a common 1e5 Hz grid; 'results' holds the originals at their own rates
+    """
+
+    freqs = np.linspace(5, 110, 22) if freqs is None else np.asarray(freqs, dtype=float)
+
+    # one latency per rate and component
+    lat = np.zeros((len(freqs), 4))
+    for k, spec in enumerate(latencies):
+        if callable(spec):
+            lat[:, k] = [spec(f) for f in freqs]
+        elif np.ndim(spec) == 0:
+            lat[:, k] = spec
+        else:
+            if len(spec) != len(freqs):
+                raise ValueError(f'latency {k + 1} has {len(spec)} values, expected one per rate ({len(freqs)})')
+            lat[:, k] = spec
+
+    results = []
+    for f, l in zip(freqs, lat):
+        with contextlib.redirect_stdout(io.StringIO()):         # abr_convolution_split prints a line per component
+            results.append(abr_convolution_split(output, click_onset=click_onset, fMod=f, dur=dur,
+                                                 latencies=tuple(l), show_plots=False, single_click=True))
+
+    if show_plots:
+        fig, ax = plt.subplots(figsize=(11, 6))
+        cmap = mcolors.LinearSegmentedColormap.from_list('shade', plt.cm.Blues(np.linspace(0.25, 1.0, 256)))
+        norm = mcolors.Normalize(freqs.min(), freqs.max())
+        for f, res in zip(freqs, results):
+            ax.plot(res['total'][0] * 1e3, res['total'][1] * 1e6, color=cmap(norm(f)), linewidth=1.2)
+        fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax, label='Click rate (Hz)')
+        ax.set_xlim(0, dur * 1e3)
+        ax.set_xlabel('Time (ms)')
+        ax.set_ylabel('Amplitude (uV)')
+        ax.set_title('Wave_func for different click rates')
+        ax.grid(True)
+        plt.tight_layout()
+        plt.savefig('frequency_runner.png', dpi=150, bbox_inches='tight')
+        plt.show()
+        print("✓ Plot saved as 'frequency_runner.png'")
+
+    # every rate has its own upsampled sampling rate (abr_convolution_split), so the curves have different
+    # lengths; put them on one common time grid (1e5 Hz) to stack them
+    t = np.arange(int(round(dur * 1e5))) / 1e5
+    curves = np.array([np.interp(t, r['total'][0], r['total'][1]) for r in results])
+    return {'freqs': freqs, 'latencies': lat, 'results': results, 'curves': curves, 't': t}
+
 if __name__ == "__main__":
     # Example usage with different configurations
-    
+
     print("Running easy model with default parameters...")
-    results = run_easy_model()
-    
+    start_time = time.perf_counter()
+    results = run_easy_model(stim='click')
+    elapsed_time = time.perf_counter() - start_time
+    print(f"\nIteration running time: {elapsed_time:.3f} s")
+
     if results is not None:
         print(f"\nSuccess! EFR value: {results['efr_value']:.4f} μV")
         
@@ -315,3 +569,9 @@ if __name__ == "__main__":
         # results = run_easy_model(carrier_freq=8000, poles_profile='Flat10', save_results=False)
     else:
         print("\nModel run failed. Please check the error messages above.")
+
+    if results is not None:
+        abr_results = abr_convolution_split(results['output'], click_onset=0.03, fMod=55, latencies=(0.0, 5.0e-3, 10.0e-3, 15.0e-3))
+        frequency_runner(results['output'], freqs=np.linspace(5, 110, 22),
+                         latencies=(0.0, lambda f: 1.7e-3 + f * 4e-5, lambda f: 4.3e-3 + f * 8e-5, 7e-3),
+                         click_onset=0.03, dur=0.04, show_plots=True)
