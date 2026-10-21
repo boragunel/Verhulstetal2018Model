@@ -162,3 +162,5 @@ def auditory_nerve_fiber(Vm,fs,spont,r1=r1,x=x,M=M,M2=M2,tCa=tCa,ss=ss):  ##reas
         if i>=zero_time:                        ##only start recording once the settling part is done
             solution[i-zero_time,:]=firing      
     return solution                             ## Output shape is t_N x 401
+
+

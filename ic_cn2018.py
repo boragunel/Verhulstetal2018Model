@@ -19,7 +19,7 @@ def cochlearNuclei(anfH,anfM,anfL,numH,numM,numL,fs):
 
     Acn=1.5;
     Scn=0.6;
-    inhibition_delay=int(round(1e-2*fs));
+    inhibition_delay=int(round(1e-2*fs));   #Specify 10 ms
     Tex=0.5e-3;                             #smoothed excitatory copy
     Tin=2e-3;                               #smoothed inhibitory copy
 
@@ -45,6 +45,10 @@ def cochlearNuclei(anfH,anfM,anfL,numH,numM,numL,fs):
     cn=Acn*(signal.lfilter(bEx,aEx,summedAN,axis=0)-(Scn*signal.lfilter(bIncn,aIncn,delayed_inhibition,axis=0)))
     return cn,summedAN  ##SummedAN is wave I, cn is cochlear nuclei these are called in model 2018 to create wave I and III
 
+###The filter equation takes as input summedAN, convolves it with an alpha function filter.
+##rise, peak, decay.
+##
+
 ##standard          
 def inferiorColliculus(cn,fs):
     size=len(cn[0,:])
@@ -69,9 +73,11 @@ def inferiorColliculus(cn,fs):
     bIncn = 1.0/(m+1)**2*np.array([1, 2, 1]); # numerator
     aIncn = np.array([1, -2*a, a**2]); # denominator
 
-    ic=Aic*(signal.lfilter(bEx,aEx,cn,axis=0)-Sic*signal.lfilter(bIncn,aIncn,delayed_inhibition,axis=0)/2)
+    ic=Aic*(signal.lfilter(bEx,aEx,cn,axis=0)-Sic*signal.lfilter(bIncn,aIncn,delayed_inhibition,axis=0)/2) ##output is built from CN input, not summedAN.
     return ic
 
+
+##Positive and Negative component separate.
 def splitNuclei(summedAN,fs,cn=None,ic=None):
     
     Acn=1.5;

@@ -27,7 +27,8 @@ import io
 import time
 import contextlib
 import matplotlib.colors as mcolors
-from get_RAM_stims import get_RAM_stims, get_click_stim
+from matplotlib.ticker import MultipleLocator
+from get_RAM_stims import get_RAM_stims, get_click_stim, get_pip_chirp_stim
 from model2018 import model2018
 
 from fractions import Fraction
@@ -89,10 +90,11 @@ def calculate_EFR(output):
         print(f"Error calculating EFR: {e}")
         return np.nan, None, None, None, None
 
-def run_easy_model(carrier_freq=4000, poles_profile='Flat00', show_plots=True, save_results=True, stim='click'):
+def run_easy_model(carrier_freq=4000, poles_profile='Flat00', show_plots=False, save_results=False, stim='click',
+                   stim_kwargs=None):
     """
     Easy interface to run the model2018 and calculate EFR.
-    
+
     Parameters:
     -----------
     carrier_freq : float, optional
@@ -103,7 +105,12 @@ def run_easy_model(carrier_freq=4000, poles_profile='Flat00', show_plots=True, s
         Whether to show plots of results (default: True)
     save_results : bool, optional
         Whether to save results to MAT files (default: True)
-        
+    stim : str, optional
+        'click', 'pip', 'chirp' or anything else for the RAM stimulus (default: 'click')
+    stim_kwargs : dict or None, optional
+        Overrides of the arguments of get_click_stim (stim='click') or get_pip_chirp_stim (stim='pip'/'chirp'),
+        e.g. {'click_dur': 50e-6}, {'freq': 2000} or {'fMod': 300}. Ignored for the RAM stimulus (default: None)
+
     Returns:
     --------
     dict
@@ -131,8 +138,13 @@ def run_easy_model(carrier_freq=4000, poles_profile='Flat00', show_plots=True, s
     # Generate stimulus
     print("Generating RAM stimulus...")
     try:
+        kw = stim_kwargs or {}
         if stim == 'click':
-            stimulus = get_click_stim(fs, level=80, onset=0.03, dur=0.065)
+            stimulus = get_click_stim(fs, **{'level': 80, 'onset': 0.03, 'dur': 0.065, **kw})
+        elif stim in ('pip', 'chirp'):          ##Tone pip: very short bust of sound at one fixed frequency
+            stimulus = get_pip_chirp_stim(fs, **{'kind': stim, 'n_stim': 1, 'level': 70, 'freq': 4000,
+                                                 'f_sweep': (100, 8000), 'method': 'linear', 'fMod': 200,
+                                                 'ramp_dur': 1e-3, 'onset': 0.03, 'dur': 0.065, **kw})
         else:
             stimulus = get_RAM_stims(fs, fRAM)
 
@@ -337,7 +349,8 @@ def abr_convolution_split(output, click_onset=0.03, fMod=110, window=None, dur=N
         output (default None)
     dur : float or None, optional
         Duration of the delta train and of the convolved output [s]. None = one period (1/fMod): a single
-        click, so each component is generated once and the output stops after one period (default None)
+        click, so each component is generated once and the output stops after one period. With single_click=True,
+        None = the largest latency plus the length of the unit responses, so every component runs out (default None)
     latencies : tuple of 4 floats, optional
         (Lat_1, Lat_2, Lat_3, Lat_4) [s]: delay of wave I, excitatory III, excitatory V and of both
         inhibitory parts (III and V together). Wave I and the excitatory parts keep their natural timing and
@@ -376,12 +389,16 @@ def abr_convolution_split(output, click_onset=0.03, fMod=110, window=None, dur=N
     for name, w in split.items():
         base = np.mean(w[max(i_click_in - n_edge, 0):max(i_click_in, 1)])
         waves[name] = sps.resample_poly(w - base, up, 1)
+    i_click = i_click_in * up                           # sample of the click after upsampling
+    L_ur = int(round(window * fs)) if window is not None else len(waves['I']) - i_click - n_edge * up
     if dur is None:
-        dur = 1 / fMod                                  # one period: a single click, each component generated once
+        if single_click:
+            dur = max(latencies) + L_ur / fs            # long enough for the latest component to run out
+        else:
+            dur = 1 / fMod                              # one period: each component generated once
     n = int(round(dur * fs))
     t = np.arange(n) / fs
     L_unit = int(round(fs / fMod))                      # one period in samples (whole number after upsampling)
-    i_click = i_click_in * up                           # sample of the click after upsampling
 
     # delta train over the whole signal: 1 at the start of every click, 0 elsewhere
     delta = np.zeros(n)
@@ -394,7 +411,6 @@ def abr_convolution_split(output, click_onset=0.03, fMod=110, window=None, dur=N
     # unit responses: response of each component to the click, from the click onset
     unit_responses = {}
     for name, w in waves.items():
-        L_ur = len(w) - i_click - n_edge * up if window is None else int(round(window * fs))
         if L_ur <= 0 or i_click + L_ur > len(w):
             raise ValueError(f'click_onset + window = {(i_click + L_ur) / fs * 1e3:.1f} ms does not fit in the '
                              f'{len(w) / fs * 1e3:.1f} ms of model output; lower window or make the click epoch longer')
@@ -462,6 +478,11 @@ def abr_convolution_split(output, click_onset=0.03, fMod=110, window=None, dur=N
         axes[3].legend()
         axes[3].grid(True)
 
+        for ax in axes[:2]:                             # graphs 1 and 2 are in ms
+            ax.xaxis.set_major_locator(MultipleLocator(5))
+        for ax in axes[2:]:                             # graphs 3 and 4 are in s
+            ax.xaxis.set_major_locator(MultipleLocator(0.005))
+
         plt.tight_layout()
         plt.savefig('abr_convolution_split.png', dpi=150, bbox_inches='tight')
         plt.show()
@@ -471,93 +492,100 @@ def abr_convolution_split(output, click_onset=0.03, fMod=110, window=None, dur=N
             'rate_functions': rate_functions, 'convolved': convolved, 'total': total,
             'latencies': tuple(latencies), 'fs': fs}
 
-def frequency_runner(output, freqs=None, latencies=(0.0, 1.7e-3, 4.3e-3, 7e-3), click_onset=0.03, dur=0.04,
-                     show_plots=True):
+def frequency_runner(stim='click', values=None, latencies=(0.0, 1.7e-3, 4.3e-3, 7e-3), click_onset=0.03, dur=0.04,
+                     poles_profile='Flat00', show_plots=True):
     """
-    Runs abr_convolution_split for every click rate in freqs and overlays the resulting Wave_func(t) curves
-    (x = time, y = amplitude), one curve per rate. The colour gets darker with increasing rate.
-    Every curve is the response to ONE click (single_click=True): the rate only enters through the latencies
-    you give per rate, and each response decays over the whole of dur, also past 1/rate. With the same
-    latencies for every rate all curves are identical, so give at least one latency per rate (sequence or
-    function of the rate).
+    Runs run_easy_model once for every entry of values, puts each model output through abr_convolution_split
+    and overlays the resulting Wave_func(t) curves (x = time, y = amplitude), one curve per value. The colour
+    gets darker with increasing value. What the value changes depends on the stimulus:
+    - 'click' (duration based): the click duration [s] (click_dur of get_click_stim)
+    - 'pip' / 'chirp' (frequency based): the modulation frequency fMod [Hz] (fMod of get_pip_chirp_stim); the
+      stimulus lasts one period, 1/fMod, so 200 Hz = 5 ms and a higher fMod gives a shorter pip / chirp
+    Every curve is the response to ONE stimulus (single_click=True) over the same dur, with the same latencies
+    for every value, so the curves differ only through the stimulus. Each value is a full model run, so it is slow.
 
-    Example: frequency_runner(results['output'], latencies=(0, [1e-3]*22, lambda f: 4e-3 + f * 1e-5, 7e-3))
+    Example: frequency_runner('click', np.linspace(20e-6, 160e-6, 8))
+             frequency_runner('pip', np.linspace(100, 400, 7))
 
     Parameters:
     -----------
-    output : ModelOutput or list containing it
-        model2018 output for ONE click (as for abr_convolution_split)
-    freqs : array-like or None, optional
-        Click rates [Hz]. None = 22 rates from 5 to 110 Hz in steps of 5 Hz (default None)
-    latencies : tuple of 4, optional
+    stim : str, optional
+        'click', 'pip' or 'chirp' (default 'click')
+    values : array-like or None, optional
+        Values to run [s for 'click', Hz otherwise], e.g. np.linspace(...). None = 8 click durations from 20 to
+        160 us ('click') or 7 fMod values from 100 to 400 Hz ('pip', 'chirp'). With the 30 ms onset and the 65 ms
+        window of run_easy_model, fMod must be at least ~29 Hz (default None)
+    latencies : tuple of 4 floats, optional
         (Lat_1, Lat_2, Lat_3, Lat_4) [s] = wave I, excitatory III, excitatory V, inhibitory III and V, the same
-        meaning as in abr_convolution_split. Each entry is set separately and can be
-        - a number: the same latency for all rates,
-        - a sequence with one latency per rate in freqs,
-        - a function f -> latency [s]: the latency as a function of the rate.
+        meaning as in abr_convolution_split; the same for every value
     click_onset : float, optional
-        Time of the click in the stimulus [s] (default 0.03)
+        Time of the stimulus in the model input [s]; must equal the onset in run_easy_model (default 0.03)
     dur : float, optional
-        Duration of every curve [s]; the same for all rates, so the curves are comparable (default 0.04)
+        Duration of every curve [s]; the same for all values, so the curves are comparable (default 0.04)
+    poles_profile : str, optional
+        Name of poles profile folder in ./Poles/ directory (default 'Flat00')
     show_plots : bool, optional
-        Plot the curves and save them as 'frequency_runner.png' (default True)
+        Plot the curves and save them as 'frequency_runner_<stim>.png' (default True)
 
     Returns:
     --------
-    dict with 'freqs' [Hz], 'latencies' (len(freqs) x 4 array [s]), 'results' (the abr_convolution_split
-    dict of every rate), 'curves' (len(freqs) x N array of Wave_func [V]) and 't' (time axis [s]). The
-    curves are interpolated onto a common 1e5 Hz grid; 'results' holds the originals at their own rates
+    dict with 'stim', 'values', 'results' (the abr_convolution_split dict of every value), 'curves'
+    (len(values) x N array of Wave_func [V]) and 't' (time axis [s])
     """
 
-    freqs = np.linspace(5, 110, 22) if freqs is None else np.asarray(freqs, dtype=float)
-
-    # one latency per rate and component
-    lat = np.zeros((len(freqs), 4))
-    for k, spec in enumerate(latencies):
-        if callable(spec):
-            lat[:, k] = [spec(f) for f in freqs]
-        elif np.ndim(spec) == 0:
-            lat[:, k] = spec
-        else:
-            if len(spec) != len(freqs):
-                raise ValueError(f'latency {k + 1} has {len(spec)} values, expected one per rate ({len(freqs)})')
-            lat[:, k] = spec
+    if stim == 'click':                                         # duration based
+        values = np.linspace(20e-6, 160e-6, 8) if values is None else np.asarray(values, dtype=float)
+        stim_kwargs = [{'click_dur': v} for v in values]
+        name, unit, scale = 'Click duration', 'us', 1e6
+    elif stim in ('pip', 'chirp'):                              # frequency based
+        values = np.linspace(100, 400, 7) if values is None else np.asarray(values, dtype=float)
+        stim_kwargs = [{'fMod': v} for v in values]
+        name, unit, scale = 'fMod', 'Hz', 1
+    else:
+        raise ValueError("stim must be 'click', 'pip' or 'chirp'")
 
     results = []
-    for f, l in zip(freqs, lat):
-        with contextlib.redirect_stdout(io.StringIO()):         # abr_convolution_split prints a line per component
-            results.append(abr_convolution_split(output, click_onset=click_onset, fMod=f, dur=dur,
-                                                 latencies=tuple(l), show_plots=False, single_click=True))
+    for i, (v, kw) in enumerate(zip(values, stim_kwargs)):
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log):                   # both functions print a lot
+            run = run_easy_model(poles_profile=poles_profile, show_plots=False, save_results=False,
+                                 stim=stim, stim_kwargs=kw)
+            if run is not None:
+                results.append(abr_convolution_split(run['output'], click_onset=click_onset, dur=dur,
+                                                     latencies=latencies, show_plots=False, single_click=True))
+        if run is None:
+            print(log.getvalue())
+            raise RuntimeError(f'run_easy_model failed for {name} = {v * scale:g} {unit}')
+        print(f"[{i + 1}/{len(values)}] {name} = {v * scale:g} {unit} done")
 
     if show_plots:
         fig, ax = plt.subplots(figsize=(11, 6))
         cmap = mcolors.LinearSegmentedColormap.from_list('shade', plt.cm.Blues(np.linspace(0.25, 1.0, 256)))
-        norm = mcolors.Normalize(freqs.min(), freqs.max())
-        for f, res in zip(freqs, results):
-            ax.plot(res['total'][0] * 1e3, res['total'][1] * 1e6, color=cmap(norm(f)), linewidth=1.2)
-        fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax, label='Click rate (Hz)')
-        ax.set_xlim(0, dur * 1e3)
+        norm = mcolors.Normalize(values.min() * scale, values.max() * scale)
+        for v, res in zip(values, results):
+            ax.plot(res['total'][0] * 1e3, res['total'][1] * 1e6, color=cmap(norm(v * scale)), linewidth=1.2)
+        fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax, label=f'{name} ({unit})')
+        #ax.set_xlim(0, dur * 1e3)
         ax.set_xlabel('Time (ms)')
         ax.set_ylabel('Amplitude (uV)')
-        ax.set_title('Wave_func for different click rates')
+        ax.set_title(f'Wave function for different {name} values with stimulus type: {stim}')
         ax.grid(True)
         plt.tight_layout()
-        plt.savefig('frequency_runner.png', dpi=150, bbox_inches='tight')
+        plt.savefig(f'frequency_runner_{stim}.png', dpi=150, bbox_inches='tight')
         plt.show()
-        print("✓ Plot saved as 'frequency_runner.png'")
+        print(f"✓ Plot saved as 'frequency_runner_{stim}.png'")
 
-    # every rate has its own upsampled sampling rate (abr_convolution_split), so the curves have different
-    # lengths; put them on one common time grid (1e5 Hz) to stack them
-    t = np.arange(int(round(dur * 1e5))) / 1e5
-    curves = np.array([np.interp(t, r['total'][0], r['total'][1]) for r in results])
-    return {'freqs': freqs, 'latencies': lat, 'results': results, 'curves': curves, 't': t}
+    # all runs have the same sampling rate and dur, so the curves stack directly
+    t = results[0]['total'][0]
+    curves = np.array([r['total'][1] for r in results])
+    return {'stim': stim, 'values': values, 'results': results, 'curves': curves, 't': t}
 
 if __name__ == "__main__":
     # Example usage with different configurations
 
     print("Running easy model with default parameters...")
     start_time = time.perf_counter()
-    results = run_easy_model(stim='click')
+    results = run_easy_model(stim='pip')
     elapsed_time = time.perf_counter() - start_time
     print(f"\nIteration running time: {elapsed_time:.3f} s")
 
@@ -571,7 +599,9 @@ if __name__ == "__main__":
         print("\nModel run failed. Please check the error messages above.")
 
     if results is not None:
-        abr_results = abr_convolution_split(results['output'], click_onset=0.03, fMod=55, latencies=(0.0, 5.0e-3, 10.0e-3, 15.0e-3))
-        frequency_runner(results['output'], freqs=np.linspace(5, 110, 22),
-                         latencies=(0.0, lambda f: 1.7e-3 + f * 4e-5, lambda f: 4.3e-3 + f * 8e-5, 7e-3),
-                         click_onset=0.03, dur=0.04, show_plots=True)
+        abr_results = abr_convolution_split(results['output'], click_onset=0.03, fMod=55, latencies=(0.0, 3.0e-3, 7.0e-3, 10.0e-3),
+                                          single_click=True)
+        frequency_runner('RAM', np.linspace(100, 400, 7),
+                         latencies=(0.0, 5e-3, 10e-3, 15e-3),
+                         click_onset=0.03, dur=0.1, show_plots=True)
+        
