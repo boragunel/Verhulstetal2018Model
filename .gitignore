@@ -3,3 +3,5 @@
 *.pyc
 *.dll
 *.so
+Physio-ABR-Data/
+clean_samples/

@@ -90,7 +90,7 @@ def calculate_EFR(output):
         print(f"Error calculating EFR: {e}")
         return np.nan, None, None, None, None
 
-def run_easy_model(carrier_freq=4000, poles_profile='Flat00', show_plots=False, save_results=False, stim='click',
+def run_easy_model(carrier_freq=4000, poles_profile='Flat00', show_plots=True, save_results=False, stim='click',
                    stim_kwargs=None):
     """
     Easy interface to run the model2018 and calculate EFR.
@@ -580,12 +580,82 @@ def frequency_runner(stim='click', values=None, latencies=(0.0, 1.7e-3, 4.3e-3, 
     curves = np.array([r['total'][1] for r in results])
     return {'stim': stim, 'values': values, 'results': results, 'curves': curves, 't': t}
 
+
+def level_runner(stim='click', values=None, stim_kwargs=None, latencies=(0.0, 1.7e-3, 4.3e-3, 7e-3),
+                 click_onset=0.03, dur=0.04, poles_profile='Flat00', show_plots=True):
+    """
+    Like frequency_runner, but the stimulus stays the same and the level (amplitude) changes: runs
+    run_easy_model once for every level in values, puts each model output through abr_convolution_split and
+    overlays the resulting Wave_func(t) curves, one curve per level. The colour gets darker with increasing level.
+    The level [dB SPL] sets the peak amplitude of the stimulus: amp = 20e-6 * 10**(level/20) * sqrt(2) [Pa],
+    so +20 dB = x10 amplitude and +6 dB = x2. Each value is a full model run, so it is slow.
+
+    Example: level_runner('click', np.linspace(10, 100, 10))
+             level_runner('pip', [40, 60, 80], stim_kwargs={'fMod': 200})
+
+    Parameters:
+    -----------
+    stim : str, optional
+        'click', 'pip' or 'chirp' (default 'click')
+    values : array-like or None, optional
+        Levels to run [dB SPL]. None = 8 levels from 30 to 100 dB (default None)
+    stim_kwargs : dict or None, optional
+        Fixed stimulus parameters, the same for every level (e.g. {'click_dur': 100e-6} or {'fMod': 200});
+        'level' is overwritten by values
+    latencies, click_onset, dur, poles_profile, show_plots :
+        Same as in frequency_runner (plot saved as 'level_runner_<stim>.png')
+
+    Returns:
+    --------
+    dict with 'stim', 'values', 'results', 'curves' (len(values) x N array of Wave_func [V]) and 't' (time [s])
+    """
+
+    if stim not in ('click', 'pip', 'chirp'):
+        raise ValueError("stim must be 'click', 'pip' or 'chirp'")
+    values = np.linspace(30, 100, 8) if values is None else np.asarray(values, dtype=float)
+    fixed = dict(stim_kwargs or {})
+    name, unit = 'Level', 'dB SPL'
+
+    results = []
+    for i, v in enumerate(values):
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log):                   # both functions print a lot
+            run = run_easy_model(poles_profile=poles_profile, show_plots=False, save_results=False,
+                                 stim=stim, stim_kwargs={**fixed, 'level': v})
+            if run is not None:
+                results.append(abr_convolution_split(run['output'], click_onset=click_onset, dur=dur,
+                                                     latencies=latencies, show_plots=False, single_click=True))
+        if run is None:
+            print(log.getvalue())
+            raise RuntimeError(f'run_easy_model failed for {name} = {v:g} {unit}')
+        print(f"[{i + 1}/{len(values)}] {name} = {v:g} {unit} done")
+
+    if show_plots:
+        fig, ax = plt.subplots(figsize=(11, 6))
+        cmap = mcolors.LinearSegmentedColormap.from_list('shade', plt.cm.Blues(np.linspace(0.25, 1.0, 256)))
+        norm = mcolors.Normalize(values.min(), values.max())
+        for v, res in zip(values, results):
+            ax.plot(res['total'][0] * 1e3, res['total'][1] * 1e6, color=cmap(norm(v)), linewidth=1.2)
+        fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax, label=f'{name} ({unit})')
+        ax.set_xlabel('Time (ms)')
+        ax.set_ylabel('Amplitude (uV)')
+        ax.set_title(f'Wave function for different {name} values with stimulus type: {stim}')
+        ax.grid(True)
+        plt.tight_layout()
+        plt.savefig(f'level_runner_{stim}.png', dpi=150, bbox_inches='tight')
+        plt.show()
+        print(f"✓ Plot saved as 'level_runner_{stim}.png'")
+
+    t = results[0]['total'][0]
+    curves = np.array([r['total'][1] for r in results])
+    return {'stim': stim, 'values': values, 'results': results, 'curves': curves, 't': t}
+
 if __name__ == "__main__":
     # Example usage with different configurations
 
     print("Running easy model with default parameters...")
     start_time = time.perf_counter()
-    results = run_easy_model(stim='pip')
+    results = run_easy_model(stim='chirp')
     elapsed_time = time.perf_counter() - start_time
     print(f"\nIteration running time: {elapsed_time:.3f} s")
 
@@ -601,7 +671,11 @@ if __name__ == "__main__":
     if results is not None:
         abr_results = abr_convolution_split(results['output'], click_onset=0.03, fMod=55, latencies=(0.0, 3.0e-3, 7.0e-3, 10.0e-3),
                                           single_click=True)
-        frequency_runner('RAM', np.linspace(100, 400, 7),
+        '''
+        frequency_runner('chirp', np.linspace(100, 400, 7),
                          latencies=(0.0, 5e-3, 10e-3, 15e-3),
                          click_onset=0.03, dur=0.1, show_plots=True)
-        
+        '''
+        level_runner('click', np.linspace(30, 100, 8))
+
+
